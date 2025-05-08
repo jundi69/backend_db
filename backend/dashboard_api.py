@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import json
 import math
+from collections import defaultdict
 from datetime import datetime
 
 import redis
@@ -48,86 +49,240 @@ async def root():
     return {"message": "Distributed Training Dashboard API"}
 
 
-def process_multi_miner_field_timeseries(tables, field_name_to_extract="loss"):
+# dashboard_api.py
+from collections import defaultdict
+import json
+from influxdb_client.client.flux_table import FluxStructureEncoder # Ensure imported
+from datetime import datetime # Ensure imported
+
+
+def get_all_miner_timeseries_for_field(measurement: str, field_name: str, time_range: str, query_api_instance, bucket_name: str):
     """
-    Processes Flux query results for a specific field across multiple miners.
-    Returns a dictionary where keys are miner_uids and values are their time-series data for the field.
-    Example: { "miner_122": [{"time": "...", "value": 0.5}, ...], "miner_123": [...] }
+    Fetches and processes time-series data for a specific field from a given measurement
+    across all miners.
+    Returns a dictionary: { "miner_uid1": [{"time": t, "value": v}, ...], "miner_uid2": [...] }
     """
-    miner_data_map = {}
+    # print(f"DEBUG: Fetching for measurement='{measurement}', field='{field_name}', range='{time_range}'")
+    query = f'''
+    from(bucket: "{bucket_name}")
+        |> range(start: -{time_range})
+        |> filter(fn: (r) => r._measurement == "{measurement}" and r._field == "{field_name}")
+        |> keep(columns: ["_time", "_value", "miner_uid"])
+        |> group()
+    '''
+    # print(f"DEBUG: Flux Query:\n{query}")
+    raw_result = query_api_instance.query(query)
+    try:
+        tables_json = json.loads(json.dumps(raw_result, cls=FluxStructureEncoder))
+        # print(f"DEBUG: tables_json from FluxStructureEncoder: {json.dumps(tables_json, indent=2)}")
+    except Exception as e:
+        print(f"DEBUG: Error during FluxStructureEncoder processing: {e}")
+        tables_json = []
 
-    # The Flux query should ideally group data in a way that makes processing easier.
-    # Let's assume the query gives us tables where each table might contain records for multiple miners,
-    # or one table per miner if grouped by miner_uid first.
-    # The crucial part is that each record has 'miner_uid', '_time', and '_value' for the target field.
+    miner_data_map = defaultdict(list)
 
-    # Assuming `tables` is the direct result from a query like:
-    # from(bucket: "...")
-    #   |> range(...)
-    #   |> filter(fn: (r) => r._measurement == "training_metrics" and r._field == "loss")
-    #   |> keep(columns: ["_time", "_value", "miner_uid"]) // Ensure miner_uid is present
+    # if not tables_json:
+        # print(f"DEBUG: tables_json is empty. No data from InfluxDB query for {field_name}?")
 
-    for table in tables: # `tables` is the raw JSON from FluxStructureEncoder if you used it.
-                         # If it's the direct InfluxDB client result, it's a list of FluxTable.
-        for record_data in table.get("records", []): # If using FluxStructureEncoder output
-        # for record in table.records: # If using direct InfluxDB client FluxTable list
-            # miner_uid = record.values.get("miner_uid")
-            # dt_obj = record.values.get("_time")
-            # value = record.values.get("_value")
-            miner_uid = record_data.get("miner_uid") # From FluxStructureEncoder output
-            dt_obj = record_data.get("_time")       # From FluxStructureEncoder output
-            value = record_data.get("_value")         # From FluxStructureEncoder output
+    for table_data in tables_json:
+        # print(f"DEBUG: Processing table_data with keys: {list(table_data.keys())}")
+        records = table_data.get("records", [])
+        # if not records:
+            # print(f"DEBUG: No records in this table_data.")
+        for record_data in records:
+            # print(f"DEBUG: Full record_data: {record_data}")
+
+            # Corrected extraction: All relevant fields are inside the 'values' sub-dictionary
+            record_values = record_data.get("values", {})
+
+            miner_uid = record_values.get("miner_uid")
+            dt_obj = record_values.get("_time") # _time from values
+            value = record_values.get("_value")   # _value from values
+
+            # print(f"DEBUG: Extracted - miner_uid: {miner_uid}, time: {dt_obj}, value: {value}")
 
             if miner_uid is None or dt_obj is None or value is None:
-                continue # Skip records with missing essential data
+                # print(f"DEBUG: Skipping record due to missing data from 'values' dict: {record_values}")
+                continue
 
-            # Convert time if it's a datetime object (it should be if coming from InfluxDB client directly)
-            # If using FluxStructureEncoder, it might already be a string.
-            if isinstance(dt_obj, datetime):
-                time_str = dt_obj.isoformat()
-            else: # Assume it's already a string (e.g. from FluxStructureEncoder)
-                time_str = str(dt_obj)
-
-
-            if miner_uid not in miner_data_map:
-                miner_data_map[miner_uid] = []
+            time_str = str(dt_obj) # FluxStructureEncoder usually gives ISO strings for time
+            try:
+                processed_value = float(value) if field_name != "epoch" else int(value)
+            except ValueError:
+                # print(f"DEBUG: ValueError converting value '{value}' for field '{field_name}', miner '{miner_uid}'. Skipping.")
+                continue
             
-            miner_data_map[miner_uid].append({"time": time_str, "value": float(value)}) # Ensure value is float
+            miner_data_map[miner_uid].append({"time": time_str, "value": processed_value})
 
-    # Sort each miner's time-series
-    for uid in miner_data_map:
-        miner_data_map[uid] = sorted(miner_data_map[uid], key=lambda x: x["time"])
+    # if not miner_data_map:
+        # print(f"DEBUG: miner_data_map is empty after processing all records for {field_name}.")
+    # else:
+        # print(f"DEBUG: miner_data_map for {field_name} before sorting: {dict(miner_data_map)}")
+
+
+    for uid_key in list(miner_data_map.keys()):
+        miner_data_map[uid_key] = sorted(miner_data_map[uid_key], key=lambda x: x["time"])
     
-    return miner_data_map
+    # print(f"DEBUG: Returning for {field_name}: {dict(miner_data_map)}")
+    return dict(miner_data_map)
+
+
+# Helper to calculate aggregate time-series (e.g., average, max) from per-miner series
+def calculate_aggregate_timeseries(
+    all_miner_series: dict, aggregation_type: str = "average"
+):
+    """
+    Calculates an aggregate time-series (average, max, sum) from a dictionary of per-miner time-series.
+    all_miner_series: { "miner_uid1": [{"time": t, "value": v}, ...], ... }
+    Returns: list of {"time": t, "value": aggregated_v}
+    """
+    if not all_miner_series:
+        return []
+
+    # Collect all data points by timestamp
+    points_by_time = defaultdict(list)
+    for miner_uid, series in all_miner_series.items():
+        for point in series:
+            points_by_time[point["time"]].append(point["value"])
+
+    aggregated_series = []
+    for time_str, values in sorted(points_by_time.items()):
+        if not values:
+            continue
+
+        agg_value = None
+        if aggregation_type == "average":
+            agg_value = sum(values) / len(values)
+        elif aggregation_type == "max":
+            agg_value = max(values)
+        elif aggregation_type == "sum":
+            agg_value = sum(values)
+        # Add other aggregations if needed
+
+        if agg_value is not None:
+            aggregated_series.append({"time": time_str, "value": agg_value})
+
+    return sorted(aggregated_series, key=lambda x: x["time"])
+
 
 @app.get("/metrics/global")
 async def get_global_metrics(time_range: str = "1h"):
-    """Get global training metrics for all miners"""
-    cache_key = f"global_metrics:{time_range}"
+    """
+    Derive all global overview metrics from individual miner data.
+    """
+    cache_key = f"derived_global_overview:{time_range}"
     cached = redis_client.get(cache_key)
-
     if cached:
-        return json.loads(cached)
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            print(f"Warning: Malformed cache for key {cache_key}")
 
-    query = f'''
-    from(bucket: "{INFLUXDB_BUCKET}")
-        |> range(start: -{time_range})
-        |> filter(fn: (r) => r._measurement == "global_training_metrics")
-        |> group(columns: ["_time", "_field"])
-        |> yield(name: "global_metrics")
-    '''
+    final_result = {
+        "all_miner_losses": {},
+        "all_miner_perplexities": {},
+        "global_average_loss_series": [],
+        "global_average_perplexity_series": [],
+        "global_max_epoch_series": [],
+        "global_average_training_rate_series": [],
+        "global_total_bandwidth_series": [],  # Or average, depending on what "bandwidth" field means
+        "active_miners_count_series": [],
+        "active_miners_current": 0,
+    }
 
     try:
-        result = query_api.query(query)
-        tables = json.loads(json.dumps(result, cls=FluxStructureEncoder))
+        # 1. Get all miner losses from "training_metrics"
+        all_miner_losses = get_all_miner_timeseries_for_field(
+            "training_metrics", "loss", time_range, query_api, INFLUXDB_BUCKET
+        )
+        final_result["all_miner_losses"] = all_miner_losses
+        final_result["global_average_loss_series"] = calculate_aggregate_timeseries(
+            all_miner_losses, "average"
+        )
 
-        # Process the data for frontend consumption
-        processed_data = process_metrics_for_dashboard(tables)
+        # 2. Calculate perplexities from losses for each miner
+        all_miner_perplexities = {}
+        for miner_uid, loss_series in all_miner_losses.items():
+            perplexity_series = []
+            for point in loss_series:
+                try:
+                    if point.get("value") is not None:
+                        perplexity_series.append(
+                            {
+                                "time": point["time"],
+                                "value": math.exp(float(point["value"])),
+                            }
+                        )
+                except (TypeError, ValueError):
+                    pass  # Ignore errors for individual points
+            all_miner_perplexities[miner_uid] = perplexity_series
+        final_result["all_miner_perplexities"] = all_miner_perplexities
+        final_result["global_average_perplexity_series"] = (
+            calculate_aggregate_timeseries(all_miner_perplexities, "average")
+        )
 
-        # Cache the result
-        redis_client.setex(cache_key, CACHE_TTL, json.dumps(processed_data))
-        return processed_data
+        # 3. Get all miner epochs from "training_metrics" and find max epoch series
+        all_miner_epochs = get_all_miner_timeseries_for_field(
+            "training_metrics", "epoch", time_range, query_api, INFLUXDB_BUCKET
+        )
+        final_result["global_max_epoch_series"] = calculate_aggregate_timeseries(
+            all_miner_epochs, "max"
+        )
+
+        # 4. Get all miner training rates (e.g., "samples_per_second") from "training_metrics" and average
+        #    Assuming 'samples_per_second' is the field for training rate. Adjust if different.
+        all_miner_training_rates = get_all_miner_timeseries_for_field(
+            "training_metrics",
+            "samples_per_second",
+            time_range,
+            query_api,
+            INFLUXDB_BUCKET,
+        )
+        final_result["global_average_training_rate_series"] = (
+            calculate_aggregate_timeseries(all_miner_training_rates, "average")
+        )
+
+        # 5. Get all miner bandwidth from "network_metrics" and sum (or average)
+        #    Assuming 'bandwidth' is the field name in 'network_metrics'.
+        all_miner_bandwidths = get_all_miner_timeseries_for_field(
+            "network_metrics", "bandwidth", time_range, query_api, INFLUXDB_BUCKET
+        )
+        # Summing bandwidth might make sense if it's individual usage. Averaging if it's a shared resource measure.
+        final_result["global_total_bandwidth_series"] = calculate_aggregate_timeseries(
+            all_miner_bandwidths, "sum"
+        )
+
+        # 6. Derive active_miners_count_series and current active miners (from loss data, for example)
+        active_miner_timestamps = defaultdict(set)
+        unique_miners_overall = set()
+        for (
+            miner_uid,
+            series_data,
+        ) in all_miner_losses.items():  # Use any comprehensive per-miner series
+            unique_miners_overall.add(miner_uid)
+            for point in series_data:
+                active_miner_timestamps[point["time"]].add(miner_uid)
+
+        active_count_series = []
+        if active_miner_timestamps:  # Check if not empty
+            for ts, uids in sorted(active_miner_timestamps.items()):
+                active_count_series.append({"time": ts, "value": len(uids)})
+            final_result["active_miners_current"] = len(
+                active_miner_timestamps.get(
+                    max(active_miner_timestamps.keys(), default=None), set()
+                )
+            )
+        else:  # No data points found
+            final_result["active_miners_current"] = 0
+
+        final_result["active_miners_count_series"] = active_count_series
+
+        redis_client.setex(cache_key, CACHE_TTL, json.dumps(final_result))
+        return final_result
     except Exception as e:
+        import traceback
+
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
