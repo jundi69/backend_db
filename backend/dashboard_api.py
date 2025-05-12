@@ -3,11 +3,14 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
+import asyncio
 import json
 import math
+import traceback
 from collections import defaultdict
 from datetime import datetime
 
+import geoip2.database
 import redis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,6 +46,152 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 redis_client = redis.from_url(REDIS_URL)
 CACHE_TTL = 60  # seconds
 
+try:
+    import bittensor as bt
+
+    metagraph = bt.metagraph(netuid=38)  # Replace with your actual netuid if needed
+    print("Successfully initialized bittensor metagraph.")
+except ImportError:
+    print(
+        "Warning: bittensor library not found or metagraph sync failed. Location updates might not work."
+    )
+    metagraph = None
+except Exception as e:
+    print(f"Warning: Error initializing bittensor metagraph: {e}")
+    metagraph = None
+
+
+# --- GeoIP Configuration ---
+GEOLITE2_DB_PATH = os.getenv(
+    "GEOLITE2_DB_PATH", "data/GeoLite2-City.mmdb"
+)  # Default path
+LOCATION_UPDATE_INTERVAL_SECONDS = 300  # Update locations every 5 minutes
+
+try:
+    geoip_reader = geoip2.database.Reader(GEOLITE2_DB_PATH)
+    print(f"Successfully loaded GeoIP database from: {GEOLITE2_DB_PATH}")
+except FileNotFoundError:
+    print(
+        f"ERROR: GeoLite2 database not found at {GEOLITE2_DB_PATH}. Miner location features will be disabled."
+    )
+    geoip_reader = None
+except Exception as e:
+    print(f"ERROR: Failed to load GeoLite2 database: {e}")
+    geoip_reader = None
+
+
+async def update_all_miner_locations():
+    """Periodically fetches miner IPs and updates their geo-location in Redis."""
+    if not geoip_reader:
+        print("GeoIP Reader not available, skipping location update.")
+        return
+    if not metagraph:
+        print("Metagraph not available, skipping location update.")
+        return
+    if metagraph.n == 0: # Check if metagraph has any neurons
+        print("Metagraph is empty, skipping location update.")
+        return
+
+    print("Starting periodic miner location update...")
+    try:
+        # Optional: Ensure metagraph is synced if necessary
+        # Consider adding metagraph.sync() here if needed, handling potential errors
+        # try:
+        #    metagraph.sync()
+        #    print("Metagraph synced successfully.")
+        # except Exception as e:
+        #    print(f"Warning: Failed to sync metagraph during location update: {e}")
+        #    # Decide if you want to proceed with potentially stale data or return
+
+        locations_updated = 0
+        # Iterate through all UIDs from 0 to n-1
+        for uid in range(metagraph.n):
+            try:
+                # Get the AxonInfo using the UID as the index
+                axon = metagraph.axons[uid]
+
+                # Check if this specific UID is serving
+                if not axon.is_serving:
+                    # Optional: log skipping non-serving UIDs
+                    # print(f"Skipping UID {uid}: Not serving.")
+                    continue
+
+                # --- Get IP Address (from the AxonInfo object) ---
+                ip_address = axon.ip
+                # ---------------------------------------------------------
+
+                if not ip_address or ip_address == "0.0.0.0" or ip_address.startswith("192.168.") or ip_address.startswith("10.") or ":" in ip_address: # Also skip IPv6 for now
+                    # Optional: log skipping invalid/local IPs
+                    # print(f"Skipping location update for UID {uid}: Invalid, private, or IPv6 IP {ip_address}")
+                    continue # Skip invalid, local, or IPv6 IPs for simplicity with GeoLite2 City
+
+                # Perform GeoIP lookup
+                try:
+                    response = geoip_reader.city(ip_address)
+                    lat = response.location.latitude
+                    lon = response.location.longitude
+                    city = response.city.name or "Unknown City"
+                    country = response.country.name or "Unknown Country"
+
+                    if lat is not None and lon is not None:
+                        # Store in Redis Hash (overwrite previous)
+                        redis_key = f"miner_location:{uid}"
+                        redis_client.hmset(redis_key, {
+                            "uid": uid,
+                            "lat": lat,
+                            "lon": lon,
+                            "city": city,
+                            "country": country,
+                            "ip": ip_address, # Store IP for debugging?
+                            "last_updated": datetime.utcnow().isoformat()
+                        })
+                        # Optional: log successful update
+                        print(f"Updated location for UID {uid} ({ip_address}): {city}, {country} ({lat:.4f}, {lon:.4f})")
+                        locations_updated += 1
+                    else:
+                         # Optional: log missing lat/lon in response
+                         print(f"Skipping location update for UID {uid} ({ip_address}): Lat/Lon not found in GeoIP response.")
+                         pass # Continue to next UID
+
+
+                except geoip2.errors.AddressNotFoundError:
+                    # Optional: log IP not found in DB
+                    print(f"IP address not found in GeoIP database: {ip_address} (UID: {uid})")
+                    # Optionally clear old location data?
+                    # redis_client.delete(f"miner_location:{uid}")
+                    pass # Continue to next UID
+                except Exception as e:
+                    print(f"Error during GeoIP lookup for {ip_address} (UID: {uid}): {e}")
+
+            except IndexError:
+                 # This might happen if metagraph.n changes during iteration, though unlikely with range(metagraph.n)
+                 print(f"IndexError accessing axon for UID {uid}. Metagraph size might have changed unexpectedly.")
+            except Exception as e:
+                print(f"Error processing UID {uid} for location update: {e}")
+                # traceback.print_exc() # Uncomment for more detailed debugging if needed
+
+        print(f"Finished miner location update. Updated {locations_updated} locations.")
+
+    except Exception as e:
+        print(f"ERROR during periodic location update task: {e}")
+        traceback.print_exc()
+
+
+async def periodic_location_updater():
+    """Runs the update task periodically."""
+    while True:
+        await update_all_miner_locations()
+        await asyncio.sleep(LOCATION_UPDATE_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on application startup."""
+    # Start the periodic location updater in the background
+    # Note: For production, consider a more robust scheduler like APScheduler or Celery
+    asyncio.create_task(periodic_location_updater())
+    print("Started periodic location update task.")
+
 
 @app.get("/")
 async def root():
@@ -50,13 +199,15 @@ async def root():
 
 
 # dashboard_api.py
-from collections import defaultdict
-import json
-from influxdb_client.client.flux_table import FluxStructureEncoder # Ensure imported
-from datetime import datetime # Ensure imported
 
 
-def get_all_miner_timeseries_for_field(measurement: str, field_name: str, time_range: str, query_api_instance, bucket_name: str):
+def get_all_miner_timeseries_for_field(
+    measurement: str,
+    field_name: str,
+    time_range: str,
+    query_api_instance,
+    bucket_name: str,
+):
     """
     Fetches and processes time-series data for a specific field from a given measurement
     across all miners.
@@ -82,13 +233,13 @@ def get_all_miner_timeseries_for_field(measurement: str, field_name: str, time_r
     miner_data_map = defaultdict(list)
 
     # if not tables_json:
-        # print(f"DEBUG: tables_json is empty. No data from InfluxDB query for {field_name}?")
+    # print(f"DEBUG: tables_json is empty. No data from InfluxDB query for {field_name}?")
 
     for table_data in tables_json:
         # print(f"DEBUG: Processing table_data with keys: {list(table_data.keys())}")
         records = table_data.get("records", [])
         # if not records:
-            # print(f"DEBUG: No records in this table_data.")
+        # print(f"DEBUG: No records in this table_data.")
         for record_data in records:
             # print(f"DEBUG: Full record_data: {record_data}")
 
@@ -96,8 +247,8 @@ def get_all_miner_timeseries_for_field(measurement: str, field_name: str, time_r
             record_values = record_data.get("values", {})
 
             miner_uid = record_values.get("miner_uid")
-            dt_obj = record_values.get("_time") # _time from values
-            value = record_values.get("_value")   # _value from values
+            dt_obj = record_values.get("_time")  # _time from values
+            value = record_values.get("_value")  # _value from values
 
             # print(f"DEBUG: Extracted - miner_uid: {miner_uid}, time: {dt_obj}, value: {value}")
 
@@ -105,24 +256,29 @@ def get_all_miner_timeseries_for_field(measurement: str, field_name: str, time_r
                 # print(f"DEBUG: Skipping record due to missing data from 'values' dict: {record_values}")
                 continue
 
-            time_str = str(dt_obj) # FluxStructureEncoder usually gives ISO strings for time
+            time_str = str(
+                dt_obj
+            )  # FluxStructureEncoder usually gives ISO strings for time
             try:
                 processed_value = float(value) if field_name != "epoch" else int(value)
             except ValueError:
                 # print(f"DEBUG: ValueError converting value '{value}' for field '{field_name}', miner '{miner_uid}'. Skipping.")
                 continue
-            
-            miner_data_map[miner_uid].append({"time": time_str, "value": processed_value})
+
+            miner_data_map[miner_uid].append(
+                {"time": time_str, "value": processed_value}
+            )
 
     # if not miner_data_map:
-        # print(f"DEBUG: miner_data_map is empty after processing all records for {field_name}.")
+    # print(f"DEBUG: miner_data_map is empty after processing all records for {field_name}.")
     # else:
-        # print(f"DEBUG: miner_data_map for {field_name} before sorting: {dict(miner_data_map)}")
-
+    # print(f"DEBUG: miner_data_map for {field_name} before sorting: {dict(miner_data_map)}")
 
     for uid_key in list(miner_data_map.keys()):
-        miner_data_map[uid_key] = sorted(miner_data_map[uid_key], key=lambda x: x["time"])
-    
+        miner_data_map[uid_key] = sorted(
+            miner_data_map[uid_key], key=lambda x: x["time"]
+        )
+
     # print(f"DEBUG: Returning for {field_name}: {dict(miner_data_map)}")
     return dict(miner_data_map)
 
@@ -479,29 +635,94 @@ async def get_validator_metrics(uid: int, time_range: str = "1h"):
 
 @app.get("/metrics/allreduce")
 async def get_allreduce_metrics(time_range: str = "1d"):
-    """Get metrics about AllReduce operations"""
-    cache_key = f"allreduce:{time_range}"
+    """Get detailed AllReduce metrics including validator reports"""
+    cache_key = f"allreduce_detailed:{time_range}"  # Use a new cache key
     cached = redis_client.get(cache_key)
-
     if cached:
-        return json.loads(cached)
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            print(f"Warning: Malformed cache for key {cache_key}")
 
-    query = f'''
+    # Query needs to ensure validator_uid is selected (Flux usually includes all tags)
+    # The grouping in Flux might not be necessary anymore as we process in Python
+    query = f''' 
     from(bucket: "{INFLUXDB_BUCKET}")
         |> range(start: -{time_range})
         |> filter(fn: (r) => r._measurement == "allreduce_operations")
-        |> group(columns: ["epoch", "operation_id"])
+        |> keep(columns: ["_time", "_field", "_value", "operation_id", "epoch", "validator_uid"]) 
+        |> group() // Ungroup might be simpler for Python processing
     '''
-
     try:
         result = query_api.query(query)
-        processed_data = process_allreduce_metrics(result)
+        # Use the new processing function
+        processed_data = process_allreduce_validator_reports(result)
 
         # Cache the result
         redis_client.setex(cache_key, CACHE_TTL, json.dumps(processed_data))
         return processed_data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching/processing AllReduce data: {str(e)}",
+        )
+
+
+@app.get("/locations/miners")
+async def get_miner_locations():
+    """Get the latest known geographic locations of active miners."""
+    cache_key = "miner_locations_latest"
+    cached = redis_client.get(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            print(f"Warning: Malformed cache for key {cache_key}")
+
+    locations = []
+    # Get UIDs of miners considered 'active' (e.g., recently reported or present in metagraph)
+    # Option 1: Use the existing /metrics/miners logic (queries InfluxDB for recent metagraph_metrics)
+    # miner_uids_str = await get_miners_list() # Reuse existing endpoint logic
+    # miner_uids = [int(uid_str) for uid_str in miner_uids_str if uid_str.isdigit()]
+
+    # Option 2: Use UIDs known to have location data in Redis (simpler if updater runs reliably)
+    miner_location_keys = redis_client.keys("miner_location:*")
+    miner_uids = [int(key.decode().split(":")[1]) for key in miner_location_keys]
+
+    print(f"Retrieving locations for {len(miner_uids)} UIDs found in Redis keys.")
+
+    for uid in miner_uids:
+        redis_key = f"miner_location:{uid}"
+        location_data = redis_client.hgetall(redis_key)
+        if location_data:
+            try:
+                # Decode from bytes and convert types
+                locations.append(
+                    {
+                        "uid": int(
+                            location_data.get(b"uid", uid)
+                        ),  # Fallback to loop uid
+                        "lat": float(location_data.get(b"lat", 0.0)),
+                        "lon": float(location_data.get(b"lon", 0.0)),
+                        "city": location_data.get(b"city", b"Unknown").decode(),
+                        "country": location_data.get(b"country", b"Unknown").decode(),
+                        "last_updated": location_data.get(
+                            b"last_updated", b""
+                        ).decode(),
+                    }
+                )
+            except (ValueError, TypeError, KeyError) as e:
+                print(
+                    f"Error processing location data for UID {uid} from Redis: {e} - Data: {location_data}"
+                )
+
+    # Cache the result
+    redis_client.setex(cache_key, CACHE_TTL, json.dumps(locations))
+    print(f"Returning {len(locations)} miner locations.")
+    return locations
 
 
 # Helper functions to process InfluxDB data for frontend consumption
@@ -660,37 +881,97 @@ def process_validator_metrics(result):
     return miner_scores
 
 
-def process_allreduce_metrics(result):
-    """Process AllReduce operation metrics"""
-    operations = []
-
-    # Group by operation_id
-    op_groups = {}
+def process_allreduce_validator_reports(result):
+    """
+    Process AllReduce metrics, grouping by operation and nesting validator reports.
+    Output: [
+        {
+            "operation_id": "...",
+            "epoch": "...",
+            "representative_time": "...", // e.g., earliest time reported for this op
+            "validator_reports": [
+                {"validator_uid": "...", "time": "...", "metrics": {...}},
+                ...
+            ]
+        }, ...
+    ]
+    """
+    # Use defaultdict for easier handling of nested structures
+    operations_data = defaultdict(lambda: {"validator_reports": [], "times": []})
 
     for table in result:
         for record in table.records:
-            op_id = record.values.get("operation_id")
-            field = record.values.get("_field")
-            value = record.values.get("_value")
-            time = record.values.get("_time")
-            epoch = record.values.get("epoch")
+            try:
+                op_id = record.values.get("operation_id")
+                epoch = record.values.get("epoch")
+                validator_uid = record.values.get("validator_uid")
+                field = record.values.get("_field")
+                value = record.values.get("_value")
+                time = record.values.get("_time")  # Keep the specific report time
 
-            if op_id not in op_groups:
-                op_groups[op_id] = {
-                    "operation_id": op_id,
-                    "epoch": epoch,
-                    "time": time,
-                    "metrics": {},
-                }
+                if not all([op_id, epoch, validator_uid, field, time]):
+                    # Skip incomplete records
+                    continue
 
-            op_groups[op_id]["metrics"][field] = value
+                # Use (op_id, epoch) as the main key
+                op_key = (op_id, epoch)
 
-    # Convert to list
-    for op_id, data in op_groups.items():
-        operations.append(data)
+                # Find or create the report for this validator within this operation
+                validator_report = None
+                for report in operations_data[op_key]["validator_reports"]:
+                    if report["validator_uid"] == validator_uid:
+                        validator_report = report
+                        break
 
-    # Sort by time
-    return sorted(operations, key=lambda x: x["time"], reverse=True)
+                if validator_report is None:
+                    validator_report = {
+                        "validator_uid": validator_uid,
+                        "time": time.isoformat()
+                        if isinstance(time, datetime)
+                        else str(time),
+                        "metrics": {},
+                    }
+                    operations_data[op_key]["validator_reports"].append(
+                        validator_report
+                    )
+                    # Store time for finding representative time later
+                    operations_data[op_key]["times"].append(time)
+
+                # Add the metric to this validator's report
+                validator_report["metrics"][field] = value
+
+            except Exception as e:
+                # Log potential errors during record processing
+                print(f"Error processing record: {record.values} - {e}")
+                continue
+
+    # Convert the defaultdict to the desired list structure
+    processed_list = []
+    for (op_id, epoch), data in operations_data.items():
+        if not data["validator_reports"]:  # Skip if no valid reports were added
+            continue
+
+        # Sort validator reports for consistency (e.g., by UID)
+        data["validator_reports"].sort(key=lambda x: int(x["validator_uid"]))
+
+        # Determine a representative time (e.g., the earliest report time)
+        representative_time = min(data["times"]) if data["times"] else None
+
+        processed_list.append(
+            {
+                "operation_id": op_id,
+                "epoch": epoch,
+                "representative_time": representative_time.isoformat()
+                if isinstance(representative_time, datetime)
+                else str(representative_time),
+                "validator_reports": data["validator_reports"],
+            }
+        )
+
+    # Sort the final list of operations (e.g., by time descending)
+    processed_list.sort(key=lambda x: x["representative_time"], reverse=True)
+
+    return processed_list
 
 
 if __name__ == "__main__":
