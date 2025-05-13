@@ -93,15 +93,22 @@ async def update_all_miner_locations():
         return
 
     print("Starting periodic miner location update...")
+    active_serving_miners_count = 0 # Initialize counter for this run
+
     try:
         # Optional: Ensure metagraph is synced if necessary
         # Consider adding metagraph.sync() here if needed, handling potential errors
-        # try:
-        #    metagraph.sync()
-        #    print("Metagraph synced successfully.")
-        # except Exception as e:
-        #    print(f"Warning: Failed to sync metagraph during location update: {e}")
-        #    # Decide if you want to proceed with potentially stale data or return
+        try:
+           metagraph.sync()
+           print("Metagraph synced successfully.")
+        except Exception as e:
+           print(f"Warning: Failed to sync metagraph during location update: {e}")
+           # Decide if you want to proceed with potentially stale data or return
+        
+        if metagraph.n == 0:
+            print("Metagraph is empty (n=0), skipping axon processing.")
+            redis_client.set("active_miners_metagraph_count", 0) # Set count to 0
+            # return # If geoip_reader is also None, then we can return
 
         locations_updated = 0
         # Iterate through all UIDs from 0 to n-1
@@ -115,7 +122,9 @@ async def update_all_miner_locations():
                     # Optional: log skipping non-serving UIDs
                     # print(f"Skipping UID {uid}: Not serving.")
                     continue
-
+                
+                active_serving_miners_count += 1
+                
                 # --- Get IP Address (from the AxonInfo object) ---
                 ip_address = axon.ip
                 # ---------------------------------------------------------
@@ -169,7 +178,9 @@ async def update_all_miner_locations():
             except Exception as e:
                 print(f"Error processing UID {uid} for location update: {e}")
                 # traceback.print_exc() # Uncomment for more detailed debugging if needed
-
+        
+        # Store the counted active serving miners in Redis
+        redis_client.set("active_miners_metagraph_count", active_serving_miners_count)
         print(f"Finished miner location update. Updated {locations_updated} locations.")
 
     except Exception as e:
@@ -330,7 +341,13 @@ async def get_global_metrics(time_range: str = "1h"):
     cached = redis_client.get(cache_key)
     if cached:
         try:
-            return json.loads(cached)
+            # Attempt to inject the latest metagraph active miner count into cached data
+            data = json.loads(cached)
+            metagraph_active_count = redis_client.get("active_miners_metagraph_count")
+            if metagraph_active_count is not None:
+                data["active_miners_current"] = int(metagraph_active_count)
+            # else: data["active_miners_current"] will be from the last full computation
+            return data
         except json.JSONDecodeError:
             print(f"Warning: Malformed cache for key {cache_key}")
 
@@ -409,35 +426,41 @@ async def get_global_metrics(time_range: str = "1h"):
         )
 
         # 6. Derive active_miners_count_series and current active miners (from loss data, for example)
-        active_miner_timestamps = defaultdict(set)
-        unique_miners_overall = set()
-        for (
-            miner_uid,
-            series_data,
-        ) in all_miner_losses.items():  # Use any comprehensive per-miner series
-            unique_miners_overall.add(miner_uid)
-            for point in series_data:
-                active_miner_timestamps[point["time"]].add(miner_uid)
+        # Get active miners count from Redis (set by the background task)
+        metagraph_active_count = redis_client.get("active_miners_metagraph_count")
+        if metagraph_active_count is not None:
+            final_result["active_miners_current"] = int(metagraph_active_count)
+        else:
+            # Fallback or calculate differently if Redis key is missing (though it shouldn't be if task runs)
+            # For now, if it's missing, it will default to 0 or what was previously calculated if any.
+            # The original logic for active_miners_count_series and active_miners_current based on InfluxDB
+            # data points can remain as a fallback or for the series data if desired.
+            # However, the primary "current" count should come from the metagraph.
 
-        active_count_series = []
-        if active_miner_timestamps:  # Check if not empty
-            for ts, uids in sorted(active_miner_timestamps.items()):
-                active_count_series.append({"time": ts, "value": len(uids)})
-            final_result["active_miners_current"] = len(
-                active_miner_timestamps.get(
-                    max(active_miner_timestamps.keys(), default=None), set()
-                )
-            )
-        else:  # No data points found
-            final_result["active_miners_current"] = 0
+            # Keep your existing active_miners_count_series logic based on data points if you want that series
+            active_miner_timestamps = defaultdict(set)
+            unique_miners_overall = set()
+            # Using all_miner_losses as an example source for activity timestamps
+            for miner_uid, series_data in final_result.get("all_miner_losses", {}).items():
+                unique_miners_overall.add(miner_uid)
+                for point in series_data:
+                    active_miner_timestamps[point["time"]].add(miner_uid)
+            
+            active_count_series = []
+            if active_miner_timestamps:
+                for ts, uids in sorted(active_miner_timestamps.items()):
+                    active_count_series.append({"time": ts, "value": len(uids)})
+                # If metagraph_active_count was None, we could use this as a fallback for current too
+                if metagraph_active_count is None:
+                     final_result["active_miners_current"] = len(
+                        active_miner_timestamps.get(max(active_miner_timestamps.keys(), default=None), set())
+                     )
+            final_result["active_miners_count_series"] = active_count_series
 
-        final_result["active_miners_count_series"] = active_count_series
 
         redis_client.setex(cache_key, CACHE_TTL, json.dumps(final_result))
         return final_result
     except Exception as e:
-        import traceback
-
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
